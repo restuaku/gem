@@ -15,6 +15,9 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from aiohttp import web
+import asyncio
+import threading
 
 import config
 from sheerid_verifier import SheerIDVerifier
@@ -29,6 +32,30 @@ logger = logging.getLogger(__name__)
 # Conversation states
 WAITING_URL, CHOOSE_SCHOOL_METHOD, WAITING_SCHOOL_SEARCH, SELECT_FROM_SEARCH = range(4)
 
+
+# ==================== HTTP HEALTH CHECK SERVER ====================
+def run_health_server():
+    """Run HTTP server untuk Render Web Service health check"""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'Bot is running!')
+        
+        def log_message(self, format, *args):
+            # Suppress HTTP logs
+            pass
+    
+    port = int(os.getenv('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f"✅ Health check server running on port {port}")
+    server.serve_forever()
+
+
+# ==================== BOT HANDLERS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler untuk /start - meminta verification URL"""
@@ -54,7 +81,6 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_URL
     
-    # Simpan verification_id ke context
     context.user_data['verification_id'] = verification_id
     
     await update.message.reply_text(
@@ -81,11 +107,10 @@ async def use_preset_schools(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     
-    # Buat keyboard dengan list universitas (max 100 per page untuk Telegram limits)
     keyboard = []
     sorted_schools = sorted(config.SCHOOLS.items(), key=lambda x: x[1]['name'])
     
-    for school_id, school_data in sorted_schools[:30]:  # Limit 30 untuk demo
+    for school_id, school_data in sorted_schools[:30]:
         button_text = f"{school_data['name'][:40]}... ({school_data['state']})"
         keyboard.append([InlineKeyboardButton(
             button_text, 
@@ -124,23 +149,16 @@ async def search_schools_api(update: Update, context: ContextTypes.DEFAULT_TYPE)
     search_query = update.message.text.strip()
     
     if len(search_query) < 3:
-        await update.message.reply_text(
-            "❌ Nama terlalu pendek! Minimal 3 karakter."
-        )
+        await update.message.reply_text("❌ Nama terlalu pendek! Minimal 3 karakter.")
         return WAITING_SCHOOL_SEARCH
     
     await update.message.reply_text(f"🔍 Mencari universitas: *{search_query}*...", parse_mode='Markdown')
     
     try:
-        # Query ke SheerID Organization Search API
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
                 config.ORGSEARCH_API_URL,
-                params={
-                    'country': 'US',
-                    'type': 'UNIVERSITY',
-                    'name': search_query
-                }
+                params={'country': 'US', 'type': 'UNIVERSITY', 'name': search_query}
             )
             
             if response.status_code != 200:
@@ -148,8 +166,6 @@ async def search_schools_api(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return WAITING_SCHOOL_SEARCH
             
             results = response.json()
-            
-            # Filter hanya UNIVERSITY dan country US
             filtered_results = [
                 school for school in results 
                 if school.get('type') == 'UNIVERSITY' and school.get('country') == 'US'
@@ -163,17 +179,12 @@ async def search_schools_api(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
                 return WAITING_SCHOOL_SEARCH
             
-            # Simpan hasil search ke context
-            context.user_data['search_results'] = filtered_results[:10]  # Limit 10 hasil
+            context.user_data['search_results'] = filtered_results[:10]
             
-            # Buat keyboard dengan hasil search
             keyboard = []
             for idx, school in enumerate(filtered_results[:10]):
                 button_text = f"{school['name'][:40]}... ({school.get('city', 'N/A')}, {school.get('state', 'N/A')})"
-                keyboard.append([InlineKeyboardButton(
-                    button_text,
-                    callback_data=f"school_search_{idx}"
-                )])
+                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"school_search_{idx}")])
             
             keyboard.append([InlineKeyboardButton("🔄 Cari Lagi", callback_data="search_manual")])
             keyboard.append([InlineKeyboardButton("◀️ Kembali", callback_data="back_to_method")])
@@ -189,10 +200,7 @@ async def search_schools_api(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
     except Exception as e:
         logger.error(f"Error searching schools: {e}")
-        await update.message.reply_text(
-            "❌ Terjadi kesalahan saat mencari universitas.\n"
-            "Coba lagi atau gunakan list preset."
-        )
+        await update.message.reply_text("❌ Terjadi kesalahan saat mencari universitas.\nCoba lagi atau gunakan list preset.")
         return WAITING_SCHOOL_SEARCH
 
 
@@ -204,7 +212,6 @@ async def select_preset_school(update: Update, context: ContextTypes.DEFAULT_TYP
     school_id = query.data.replace("school_preset_", "")
     school = config.SCHOOLS[school_id]
     
-    # Simpan school data lengkap ke context
     context.user_data['selected_school'] = {
         'dict_key': school_id,
         'id': school['id'],
@@ -226,7 +233,6 @@ async def select_search_result(update: Update, context: ContextTypes.DEFAULT_TYP
     idx = int(query.data.replace("school_search_", ""))
     school = context.user_data['search_results'][idx]
     
-    # Simpan school data dari API
     context.user_data['selected_school'] = {
         'dict_key': None,
         'id': school['id'],
@@ -254,15 +260,12 @@ async def start_verification(query, context: ContextTypes.DEFAULT_TYPE):
     )
     
     try:
-        # Jalankan verifikasi
         verifier = SheerIDVerifier(verification_id)
         result = verifier.verify(school_data=school)
         
         if result['success']:
-            # Ambil data student info dari result
             student_info = result.get('student_info', {})
             
-            # Format message dengan info lengkap
             message = (
                 f"✅ *Verifikasi Berhasil!*\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -283,14 +286,10 @@ async def start_verification(query, context: ContextTypes.DEFAULT_TYPE):
                 f"   {result['message']}\n"
             )
             
-            # Tambahkan redirect URL jika ada
             if result.get('redirect_url'):
                 message += f"\n🌐 *Redirect URL:*\n   {result.get('redirect_url')}"
             
-            await query.edit_message_text(
-                message,
-                parse_mode='Markdown'
-            )
+            await query.edit_message_text(message, parse_mode='Markdown')
         else:
             await query.edit_message_text(
                 f"❌ *Verifikasi Gagal!*\n\n"
@@ -334,6 +333,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ==================== MAIN ====================
+
 def main():
     """Main function untuk run bot"""
     # Ambil token dari environment variable
@@ -341,11 +342,15 @@ def main():
     
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not found in environment variables!")
-        logger.error("Set BOT_TOKEN in Render dashboard: Dashboard > Environment")
         return
     
-    logger.info(f"🤖 Starting bot with token: {BOT_TOKEN[:10]}...")
+    logger.info(f"🤖 Starting bot...")
     
+    # Start HTTP health check server di thread terpisah
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    
+    # Initialize bot
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Conversation handler
